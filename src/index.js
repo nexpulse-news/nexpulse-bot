@@ -1,222 +1,156 @@
-// ============================================================
-// NEXPULSE BOT ENGINE — MAIN ENTRY POINT
-// The brain of Nexpulse — runs 24/7 on Railway
-// ============================================================
-
 require('dotenv').config();
-const cron      = require('node-cron');
-const logger    = require('./utils/logger');
-const db        = require('./database/connect');
-const fetcher   = require('./fetcher/newsFetcher');
-const writer    = require('./writer/aiWriter');
-const poster    = require('./poster/twitterPoster');
-const dashboard = require('./dashboard');
+const cron = require('node-cron');
+const express = require('express');
+const cors = require('cors');
+const { connect, Article } = require('./database/connect');
+const { start: startDashboard } = require('./dashboard');
+const logger = require('./utils/logger');
+
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ============================================================
-// STARTUP
+// PUBLIC API — Website fetches real articles from here
 // ============================================================
-async function startup() {
-  logger.info('🚀 NEXPULSE BOT STARTING...');
-  logger.info('================================');
+const publicApp = express();
+publicApp.use(cors());
+publicApp.use(express.json());
 
-  // Connect to database
-  await db.connect();
-  logger.info('✅ Database connected');
+// GET /api/articles — latest approved articles
+publicApp.get('/api/articles', async (req, res) => {
+  try {
+    const { category, limit = 20, page = 1 } = req.query;
+    const filter = { status: 'approved' };
+    if (category && category !== 'all') filter.category = category;
+    const articles = await Article.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit))
+      .select('headline excerpt category source sourceUrl imageUrl createdAt readTime slug _id');
+    res.json({ success: true, articles });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-  // Start dashboard server
-  dashboard.start();
-  logger.info(`✅ Dashboard running at http://localhost:${process.env.DASHBOARD_PORT || 3000}`);
+// GET /api/articles/:id — single article
+publicApp.get('/api/articles/:id', async (req, res) => {
+  try {
+    const article = await Article.findById(req.params.id);
+    if (!article) return res.status(404).json({ success: false, error: 'Not found' });
+    res.json({ success: true, article });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-  // Run once immediately on startup
-  await runBotCycle();
+// GET /api/stats — public stats
+publicApp.get('/api/stats', async (req, res) => {
+  try {
+    const total = await Article.countDocuments({ status: 'approved' });
+    const today = new Date(new Date().setHours(0,0,0,0));
+    const todayCount = await Article.countDocuments({ status: 'approved', createdAt: { $gte: today } });
+    res.json({ success: true, total, today: todayCount });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-  // Schedule: Fetch news every 30 minutes
-  const fetchInterval = process.env.FETCH_INTERVAL_MINUTES || 30;
-  cron.schedule(`*/${fetchInterval} * * * *`, async () => {
-    logger.info('⏰ SCHEDULED FETCH starting...');
-    await runBotCycle();
-  });
+// Health check
+publicApp.get('/health', (req, res) => res.json({ status: 'ok', bot: 'Nexpulse Bot v1.0' }));
 
-  // Schedule: Post to Twitter every 60 minutes
-  const postInterval = process.env.POST_INTERVAL_MINUTES || 60;
-  cron.schedule(`*/${postInterval} * * * *`, async () => {
-    logger.info('⏰ SCHEDULED POST starting...');
-    await postPendingArticles();
-  });
-
-  // Schedule: Daily stats at midnight
-  cron.schedule('0 0 * * *', async () => {
-    await printDailyStats();
-  });
-
-  logger.info('✅ Bot is running 24/7!');
-  logger.info(`📰 Fetching every ${fetchInterval} minutes`);
-  logger.info(`📤 Posting every ${postInterval} minutes`);
-  logger.info('================================');
+function startPublicAPI() {
+  const port = process.env.PUBLIC_API_PORT || 4000;
+  publicApp.listen(port, () => logger.info(`🌐 Public API live at port ${port}`));
 }
 
 // ============================================================
-// MAIN BOT CYCLE
-// Fetch → AI Write → Save → Auto-approve or Flag
+// BOT ENGINE
 // ============================================================
-async function runBotCycle() {
+async function runNewsCycle() {
+  logger.info('--- BOT CYCLE STARTING ---');
+  logger.info('📡 Fetching news from all sources...');
   try {
-    logger.info('--- BOT CYCLE STARTING ---');
+    const { fetchNews } = require('./fetcher/newsFetcher');
+    const articles = await fetchNews();
+    logger.info(`📰 Fetched ${articles.length} raw articles`);
 
-    // STEP 1: Fetch latest news
-    const rawArticles = await fetcher.fetchAll();
-    logger.info(`📰 Fetched ${rawArticles.length} raw articles`);
+    let approved = 0, flagged = 0, rejected = 0;
 
-    if (rawArticles.length === 0) {
-      logger.info('No new articles found');
-      return;
-    }
-
-    let approved = 0;
-    let flagged  = 0;
-    let rejected = 0;
-
-    // STEP 2: Process each article
-    for (const raw of rawArticles) {
+    for (const raw of articles) {
       try {
-        // Check if already processed
-        const exists = await db.Article.findOne({ sourceUrl: raw.url });
+        const exists = await Article.findOne({ sourceUrl: raw.url });
         if (exists) continue;
 
-        // STEP 3: AI writes the article
-        const article = await writer.processArticle(raw);
-        if (!article) continue;
+        await wait(2000);
 
-        // STEP 4: Auto-approve based on confidence score
-        const confidence = article.confidence || 0;
+        const writer = require('./writer/aiWriter');
+        const fn = writer.writeArticle || writer.processArticle;
+        const written = await fn(raw);
+        if (!written) continue;
 
-        if (confidence >= 85) {
-          article.status = 'approved';
-          article.autoApproved = true;
-          approved++;
-          logger.info(`✅ AUTO-APPROVED (${confidence}%): ${article.headline}`);
-          // STEP 4b: Generate images for approved articles
-          try {
-            const imageGen = require('./imageGenerator');
-            const images = await imageGen.generateArticleImages(article);
-            article.images = images;
-          } catch (imgErr) {
-            logger.warn(`Image generation skipped: ${imgErr.message}`);
-          }
-        } else if (confidence >= 60) {
-          article.status = 'flagged';
-          flagged++;
-          logger.warn(`⚠️  FLAGGED (${confidence}%): ${article.headline}`);
-        } else {
-          article.status = 'rejected';
-          rejected++;
-          logger.warn(`❌ REJECTED (${confidence}%): ${article.headline}`);
-        }
+        const headline = written.title || written.headline;
+        if (!headline) continue;
 
-        // STEP 5: Save to database
-        await db.Article.create(article);
+        const confidence = written.confidence || 75;
+        let status = confidence >= 85 ? 'approved' : confidence < 60 ? 'rejected' : 'flagged';
 
-      } catch (err) {
-        logger.error(`Error processing article: ${err.message}`);
-      }
+        const article = new Article({
+          headline,
+          excerpt: written.excerpt || written.summary || '',
+          body: written.content || written.body || '',
+          category: written.category || raw.category || 'World',
+          confidence,
+          sourceUrl: raw.url,
+          source: raw.source,
+          imageUrl: raw.imageUrl || '',
+          status,
+          tweetText: written.twitterPost || written.tweetText || `${headline} #Nexpulse #News`,
+          postedTwitter: false,
+        });
+
+        await article.save();
+
+        if (status === 'approved') { logger.info(`✅ AUTO-APPROVED (${confidence}%): ${headline.slice(0,60)}`); approved++; }
+        else if (status === 'flagged') { logger.warn(`⚠️  FLAGGED (${confidence}%): ${headline.slice(0,60)}`); flagged++; }
+        else { logger.warn(`❌ REJECTED (${confidence}%): ${headline.slice(0,60)}`); rejected++; }
+
+      } catch (e) { /* silent skip */ }
     }
 
-    logger.info(`--- CYCLE COMPLETE ---`);
-    logger.info(`✅ Approved: ${approved} | ⚠️ Flagged: ${flagged} | ❌ Rejected: ${rejected}`);
-
+    logger.info(`--- CYCLE COMPLETE --- ✅ ${approved} | ⚠️ ${flagged} | ❌ ${rejected}`);
   } catch (err) {
-    logger.error(`Bot cycle error: ${err.message}`);
+    logger.error('❌ News cycle error: ' + err.message);
   }
 }
 
-// ============================================================
-// POST PENDING ARTICLES TO ALL PLATFORMS
-// ============================================================
-async function postPendingArticles() {
+async function runPostCycle() {
   try {
-    // Get approved articles not yet posted
-    const pending = await db.Article.find({
-      status: 'approved',
-      postedTwitter: false
-    }).sort({ publishedAt: -1 }).limit(3);
-
-    if (pending.length === 0) {
-      logger.info('No pending articles to post');
-      return;
-    }
-
-    logger.info(`📤 Posting ${pending.length} articles...`);
-
-    for (const article of pending) {
-      try {
-        // Check daily post limit
-        const todayPosts = await db.Article.countDocuments({
-          postedTwitter: true,
-          postedAt: { $gte: new Date(new Date().setHours(0,0,0,0)) }
-        });
-
-        const maxPosts = parseInt(process.env.MAX_POSTS_PER_DAY) || 20;
-        if (todayPosts >= maxPosts) {
-          logger.warn(`Daily post limit (${maxPosts}) reached`);
-          break;
-        }
-
-        // Post to Twitter
-        await poster.postToTwitter(article);
-
-        // Mark as posted
-        await db.Article.findByIdAndUpdate(article._id, {
-          postedTwitter: true,
-          postedAt: new Date()
-        });
-
-        logger.info(`✅ Posted to Twitter: ${article.headline}`);
-
-        // Wait 5 seconds between posts
-        await sleep(5000);
-
-      } catch (err) {
-        logger.error(`Error posting article: ${err.message}`);
+    const { postToTwitter } = require('./poster/twitterPoster');
+    const toPost = await Article.find({ status: 'approved', postedTwitter: false }).limit(2);
+    for (const article of toPost) {
+      const posted = await postToTwitter(article);
+      if (posted) {
+        article.postedTwitter = true;
+        article.postedAt = new Date();
+        await article.save();
+        logger.info(`🐦 Posted: ${article.headline.slice(0,60)}`);
       }
+      await wait(3000);
     }
-
   } catch (err) {
-    logger.error(`Post cycle error: ${err.message}`);
+    logger.error('❌ Post cycle error: ' + err.message);
   }
 }
 
-// ============================================================
-// DAILY STATS
-// ============================================================
-async function printDailyStats() {
-  const today = new Date(new Date().setHours(0,0,0,0));
-
-  const stats = {
-    fetched:  await db.Article.countDocuments({ createdAt: { $gte: today } }),
-    approved: await db.Article.countDocuments({ status: 'approved', createdAt: { $gte: today } }),
-    flagged:  await db.Article.countDocuments({ status: 'flagged', createdAt: { $gte: today } }),
-    posted:   await db.Article.countDocuments({ postedTwitter: true, postedAt: { $gte: today } }),
-    total:    await db.Article.countDocuments()
-  };
-
-  logger.info('========= DAILY STATS =========');
-  logger.info(`📰 Fetched today:   ${stats.fetched}`);
-  logger.info(`✅ Approved today:  ${stats.approved}`);
-  logger.info(`⚠️  Flagged today:   ${stats.flagged}`);
-  logger.info(`📤 Posted today:    ${stats.posted}`);
-  logger.info(`📚 Total articles:  ${stats.total}`);
-  logger.info('================================');
+async function main() {
+  logger.info('🚀 NEXPULSE BOT STARTING...');
+  await connect();
+  startDashboard();
+  startPublicAPI();
+  await runNewsCycle();
+  cron.schedule('*/30 * * * *', runNewsCycle);
+  cron.schedule('0 * * * *', runPostCycle);
+  logger.info('✅ Bot is running 24/7!');
 }
 
-// Helper
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ============================================================
-// START THE BOT
-// ============================================================
-startup().catch(err => {
-  logger.error(`Fatal startup error: ${err.message}`);
-  process.exit(1);
-});
+main().catch(err => logger.error(err.message));

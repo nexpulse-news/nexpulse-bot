@@ -318,9 +318,9 @@ app.post('/api/articles/:id/reject', async (req, res) => {
 // START SERVER
 // ============================================================
 function start() {
-  const port = process.env.DASHBOARD_PORT || 3000;
-  app.listen(port, () => {
-    logger.info(`📊 Dashboard live at http://localhost:${port}`);
+  const port = process.env.PORT || process.env.DASHBOARD_PORT || 3000;
+  app.listen(port, '0.0.0.0', () => {
+    logger.info(`📊 Dashboard live on port ${port}`);
   });
 }
 
